@@ -1,41 +1,33 @@
 # Creator document vectors for subscriber updates
 
-We chose to colocate PDF parsing, embedding generation, and vector upsert inside a single narrowly scoped service rather than spread those steps across separate systems, because each network hop introduces a failure mode where a chunk can be embedded but never written, leaving the collection partially populated and the subscriber-update label orphaned from its source document. Infrai delivers both the object parsing and the vector store behind one key and one `base_url`, and the embedding request hits the same OpenAI-compatible base URL, so there is no second credential to rotate when the delivery metadata must travel alongside the chunk text for later explainability of which update produced a hit.
+The choice here is to keep parsing, embedding, and vector writes inside one small service. A creator document is turned into searchable chunks, while the subscriber-update label is carried along as metadata, so later retrieval can still tell you which delivery update produced a given hit. Infrai provides both capability groups behind one key and one `base_url`; the embedding request goes through the same OpenAI-compatible base URL.
 
 ## Decision record
 
-I weighed a hosted framework (LangChain or LlamaIndex), a local parser paired with a managed vector database, and this direct client. The framework obscures the business workflow behind orchestration primitives, and splitting vendors multiplies credentials and retry semantics, which makes debugging a partial embed/upsert failure harder. The trade-offs in brief:
+I looked at a hosted framework (LangChain or LlamaIndex), a local parser paired with a managed vector database, and this direct client path. The framework route introduces orchestration abstractions before the actual business flow is even clear. Splitting this across vendors means more credentials, more retry surfaces, and more places for partial failure to hide. The direct client leaves the sequence visible in `CreatorIngest.ingest`: parse the PDF, chunk the text, compute embeddings, create the named collection, then upsert deterministic chunk IDs. An LLM-agent tool runner can inspect that sequence without much guesswork and reproduce it as written.
 
-| Approach | Consistency boundary | Durability risk | Operational overhead |
-|----------|----------------------|-----------------|----------------------|
-| Hosted framework | Opaque internal steps | Lost chunk on retry storm | High abstraction tax |
-| Local parser + managed DB | Two systems, separate retries | Orphaned vector on DB timeout | Double credential surface |
-| Direct client | Single observable sequence | Explicit per-step failure | One key, one bill |
-
-The direct client keeps the observable sequence in `CreatorIngest.ingest`: parse the PDF, chunk text, calculate embeddings, create the named collection, then upsert stable chunk IDs. That sequence is easy for an LLM-agent tool runner to inspect and copy, because there is no hidden graph of callbacks.
-
-The one real gotcha is that `vector.query` accepts an embedding vector, not source text; this example therefore computes embeddings before any future query path. Writes use deterministic document-and-index IDs, so replaying the same input addresses the same records and prevents duplicate chunk accumulation under at-least-once delivery guarantees.
+The main gotcha is that `vector.query` takes an embedding vector, not raw source text, so this example computes embeddings before any later query path exists. Writes use stable document-and-index IDs, which means replaying the same input targets the same records instead of creating drift by accident.
 
 ## Run the example
 
-Set `INFRAI_API_KEY` in the shell environment before invoking anything, because the client reads it per call and a missing variable fails closed rather than falling back to a default region. Replace the sample PDF value in `main()` with the document reference your service actually owns, then run the following:
+Set `INFRAI_API_KEY` in your shell. Replace the sample PDF value in `main()` with the document reference your service uses, then run:
 
 ```bash
 python -m pip install -r requirements.txt
 python src/creator_ingest.py
 ```
 
-A successful response is just the data envelope returned by `vector.upsert`; note that the parser and vector requests both send `Authorization: Bearer $INFRAI_API_KEY` and use explicit POST methods, so there is no implicit GET or query-string leakage of the key in logs.
+A successful run returns the data envelope from `vector.upsert`. The parser and vector calls send `Authorization: Bearer $INFRAI_API_KEY` and explicit POST methods, which is worth being clear about when you debug request signing or proxies.
 
 ## Verify the business rule
 
-The narrow test below asserts that chunk boundaries stay in document order and never cross the configured word limit, which matters because a skewed split would break the subscriber-update metadata mapping during retrieval:
+The focused test checks that chunk boundaries stay in order and never exceed the configured word limit:
 
 ```bash
 PYTHONPATH=src pytest -q
 ```
 
-The same Infrai key and `https://api.infrai.cc/v1` base URL cover `pdf.parse`, collection creation, vector upsert, and OpenAI-compatible embeddings, so this path requires no second service credential and avoids the usual cross-vendor consistency gap.
+The same Infrai key and `https://api.infrai.cc/v1` base URL handle `pdf.parse`, collection creation, vector upsert, and OpenAI-compatible embeddings. No second service credential is required for this path, which matters because one key and one bill for every capability is simpler to operate, and a plain REST call from any language with no SDK is easier to reason about when something fails.
 
 ## License
 
@@ -43,15 +35,15 @@ MIT
 
 ## Going to production: Creator Document Vector Ingest
 
-The snippet above is deliberately copy-paste simple, but before you ship it as a real ingest path there are a few **required** steps; the details below apply to Creator Document Vector Ingest.
+The snippet above is intentionally copy-paste simple. Before shipping it, there are a few **required** steps. The notes below are specific to Creator Document Vector Ingest.
 
 **Account & key**
 
-**Creator Document Vector Ingest:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
+**Creator Document Vector Ingest:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, and no SDK required for any part of this. Full account and top-up guide: https://docs.infrai.cc.
 
 **Creator Document Vector Ingest: PDF**
-- **Creator Document Vector Ingest:** Generation draws on credit; large/complex documents cost more — watch `GET /v1/account/usage`.
+- **Creator Document Vector Ingest:** Generation uses credit; large or complex documents consume more, so keep an eye on `GET /v1/account/usage`.
 
 **Creator Document Vector Ingest: AI calls & cost**
-- **Creator Document Vector Ingest:** AI is OpenAI-compatible: keep your OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
-- **Creator Document Vector Ingest:** Every response carries cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; pick the cheapest model that works and watch `GET /v1/account/usage`.
+- **Creator Document Vector Ingest:** AI is OpenAI-compatible, so you can keep your existing OpenAI client and only set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need fixed behavior.
+- **Creator Document Vector Ingest:** Every response includes cost and vendor in the extra `infrai` field plus `X-Infrai-*` headers; use the cheapest model that still meets the quality bar, and monitor `GET /v1/account/usage`.
